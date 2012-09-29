@@ -1,0 +1,67 @@
+#!/usr/bin/env python
+import argparse
+import psycopg2
+import time
+from datetime import datetime, timedelta
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--table', required=True)
+parser.add_argument('--table-pk', required=True)
+parser.add_argument('--column', required=True)
+parser.add_argument('--column-type', required=True)
+parser.add_argument('--column-default', required=True)
+parser.add_argument('--batch-delay', type=float, default=1.0)
+args = parser.parse_args()
+
+conn = psycopg2.connect('')
+conn.autocommit = True
+cur = conn.cursor()
+
+cur.execute('SELECT pg_size_pretty(pg_total_relation_size(%s)), pg_total_relation_size(%s), reltuples FROM pg_class WHERE relname = %s', [args.table]*3)
+relsize_human, relsize, relrows = cur.fetchone()
+bytes_per_row = 1.0 * relsize / max(relrows, 1)
+
+print 'Relation size (with indices):', relsize_human
+print 'Relation rows:', str(round(relrows/1000000, 1)) + 'M'
+print 'Bytes per row:', round(bytes_per_row)
+
+# let's define 10K chunk size as optimal for 256 byte rows
+chunk_size = 10000 / max(int(bytes_per_row / 256), 1)
+
+cur.execute('SELECT 1 FROM pg_class, pg_attribute WHERE attname = %s AND attrelid = pg_class.oid AND relname = %s', [args.column, args.table])
+if not cur.fetchone():
+    cur.execute('ALTER TABLE {tbl} ADD COLUMN {col} {type}'.format(tbl=args.table, col=args.column, type=args.column_type))
+else:
+    print 'column already exist'
+cur.execute('ALTER TABLE {tbl} ALTER COLUMN {col} SET DEFAULT %s'.format(tbl=args.table, col=args.column), [args.column_default])
+
+pk_conn = psycopg2.connect('')
+pk_cur = pk_conn.cursor('primary_keys')
+pk_cur.itersize = chunk_size
+pk_cur.execute('SELECT {pk} FROM {tbl} WHERE {col} IS NULL'.format(pk=args.table_pk, tbl=args.table, col=args.column))
+
+started_at = datetime.utcnow()
+processed = 0
+
+while True:
+    chunk = pk_cur.fetchmany(chunk_size)
+    chunk = [i[0] for i in chunk]
+    if not len(chunk):
+        break
+    processed += len(chunk)
+    cur.execute('UPDATE {tbl} SET {col} = %s WHERE {col} IS NULL AND {pk} IN ({chunk})'.format(tbl=args.table, col=args.column, pk=args.table_pk, chunk=','.join(['%s'] * len(chunk))), [args.column_default] + chunk)
+    time.sleep(args.batch_delay)
+
+    dt = datetime.utcnow() - started_at
+    avg_rows_sec = processed / max(dt.total_seconds(), 1)
+    if avg_rows_sec > 0:
+        est = timedelta(seconds=(relrows-processed)/avg_rows_sec)
+    else:
+        est = 'never!!!'
+    print '{}% processed, {} passed, {} left, avg {} rows/sec          \r'.format(round(100.0*processed/relrows, 1), str(dt), str(est), round(avg_rows_sec))
+
+pk_cur.close()
+pk_conn.close()
+print 'updates completed'
+cur.execute('ALTER TABLE {tbl} ALTER COLUMN {col} SET NOT NULL'.format(tbl=args.table, col=args.column))
+print 'all done'
